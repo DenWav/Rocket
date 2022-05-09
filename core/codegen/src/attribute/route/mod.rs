@@ -340,6 +340,8 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
         /// Rocket code generated proxy structure.
         #vis struct #handler_fn_name {  }
 
+        impl #RouteType for #handler_fn_name {}
+
         /// Rocket code generated proxy static conversion implementations.
         impl #handler_fn_name {
             #[allow(non_snake_case, unreachable_patterns, unreachable_code)]
@@ -366,6 +368,7 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                     format: #format,
                     rank: #rank,
                     sentinels: #sentinels,
+                    route_type: #_Box::new(self),
                 }
             }
 

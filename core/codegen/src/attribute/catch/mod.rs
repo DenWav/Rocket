@@ -61,6 +61,8 @@ pub fn _catch(
         /// Rocket code generated proxy structure.
         #vis struct #user_catcher_fn_name {  }
 
+        impl #CatcherType for #user_catcher_fn_name {  }
+
         /// Rocket code generated proxy static conversion implementations.
         impl #user_catcher_fn_name {
             fn into_info(self) -> #_catcher::StaticInfo {
@@ -81,6 +83,7 @@ pub fn _catch(
                     name: stringify!(#user_catcher_fn_name),
                     code: #status_code,
                     handler: monomorphized_function,
+                    route_type: #_Box::new(self),
                 }
             }
 
