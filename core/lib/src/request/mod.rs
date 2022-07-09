@@ -8,13 +8,14 @@ mod from_request;
 mod tests;
 
 pub use self::request::Request;
-pub use self::from_request::{FromRequest, Outcome};
+pub use self::from_request::{FromRequest, Outcome, FromWebSocket, WsOutcome};
 pub use self::from_param::{FromParam, FromSegments};
 
 #[doc(inline)]
 pub use crate::response::flash::FlashMessage;
 
 pub(crate) use self::request::ConnectionMeta;
+pub(crate) use self::request::RequestState;
 
 crate::export! {
     /// Store and immediately retrieve a vector-like value `$v` (`String` or

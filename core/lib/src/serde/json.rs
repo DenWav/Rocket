@@ -189,6 +189,7 @@ impl<'r, T: Deserialize<'r>> Json<T> {
             Err(e) => return Err(Error::Io(e)),
         };
 
+        // TODO This is an issue for websockets
         Self::from_str(local_cache!(req, string))
     }
 }

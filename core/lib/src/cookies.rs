@@ -2,11 +2,11 @@ use std::fmt;
 
 use parking_lot::Mutex;
 
-use crate::Config;
 use crate::http::private::cookie;
+use crate::Config;
 
 #[doc(inline)]
-pub use self::cookie::{Cookie, SameSite, Iter};
+pub use self::cookie::{Cookie, Iter, SameSite};
 
 /// Collection of one or more HTTP cookies.
 ///
@@ -176,7 +176,7 @@ enum Op {
 impl Op {
     fn cookie(&self) -> &Cookie<'static> {
         match self {
-            Op::Add(c, _) | Op::Remove(c, _) => c
+            Op::Add(c, _) | Op::Remove(c, _) => c,
         }
     }
 }
@@ -188,7 +188,11 @@ impl<'a> CookieJar<'a> {
     }
 
     pub(crate) fn from(jar: cookie::CookieJar, config: &'a Config) -> Self {
-        CookieJar { jar, config, ops: Mutex::new(Vec::new()) }
+        CookieJar {
+            jar,
+            config,
+            ops: Mutex::new(Vec::new()),
+        }
     }
 
     /// Returns a reference to the _original_ `Cookie` inside this container
@@ -413,7 +417,7 @@ impl<'a> CookieJar<'a> {
     ///     }
     /// }
     /// ```
-    pub fn iter(&self) -> impl Iterator<Item=&Cookie<'static>> {
+    pub fn iter(&self) -> impl Iterator<Item = &Cookie<'static>> {
         self.jar.iter()
     }
 
@@ -445,11 +449,29 @@ impl<'a> CookieJar<'a> {
                     }
                 }
                 #[allow(unreachable_patterns)]
-                _ => unreachable!()
+                _ => unreachable!(),
             }
         }
 
         jar
+    }
+
+    /// Apply the changes in delta to the cookie jar in place
+    ///
+    /// This method was created to enable Websocket requests to update the cookie jar inline
+    /// between messages.
+    pub(crate) fn apply_delta(&mut self) {
+        let ops = std::mem::take(&mut *self.ops.lock());
+        for op in ops {
+            match op {
+                Op::Add(c, false) => self.add_original(c),
+                #[cfg(feature = "secrets")]
+                Op::Add(c, true) => self.add_original_private(c),
+                Op::Remove(c, _) => self.jar.remove(c),
+                #[allow(unreachable_patterns)]
+                _ => unreachable!(),
+            }
+        }
     }
 
     /// Adds an original `cookie` to this collection.
@@ -463,7 +485,9 @@ impl<'a> CookieJar<'a> {
     #[cfg_attr(nightly, doc(cfg(feature = "secrets")))]
     #[inline(always)]
     pub(crate) fn add_original_private(&mut self, cookie: Cookie<'static>) {
-        self.jar.private_mut(&self.config.secret_key.key).add_original(cookie);
+        self.jar
+            .private_mut(&self.config.secret_key.key)
+            .add_original(cookie);
     }
 
     /// For each property mentioned below, this method checks if there is a
@@ -515,7 +539,9 @@ impl<'a> CookieJar<'a> {
 
 impl fmt::Debug for CookieJar<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let pending: Vec<_> = self.ops.lock()
+        let pending: Vec<_> = self
+            .ops
+            .lock()
             .iter()
             .map(|c| c.cookie())
             .cloned()
@@ -526,5 +552,4 @@ impl fmt::Debug for CookieJar<'_> {
             .field("pending", &pending)
             .finish()
     }
-
 }

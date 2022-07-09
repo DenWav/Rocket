@@ -89,6 +89,7 @@ define_exported_paths! {
     Outcome => ::rocket::outcome::Outcome,
     FromForm => ::rocket::form::FromForm,
     FromRequest => ::rocket::request::FromRequest,
+    FromWebSocket => ::rocket::request::FromWebSocket,
     FromData => ::rocket::data::FromData,
     FromSegments => ::rocket::request::FromSegments,
     FromParam => ::rocket::request::FromParam,
@@ -101,6 +102,11 @@ define_exported_paths! {
     Catcher => ::rocket::Catcher,
     SmallVec => ::rocket::http::private::SmallVec,
     Status => ::rocket::http::Status,
+
+    WebSocketEvent => ::rocket::route::WebSocketEvent,
+    WebSocket => ::rocket::websocket::Channel,
+    WebSocketData => ::rocket::websocket::WebSocketData,
+    WebSocketStatus => ::rocket::websocket::WebSocketStatus,
 }
 
 macro_rules! define_spanned_export {

@@ -51,9 +51,9 @@ version = "0.13"
 optional = true
 
 [dependencies.hyper]
-version = "0.14.9"
+version = "0.14.20"
 default-features = false
-features = ["http1", "runtime", "server", "stream"]
+features = ["http1", "http2", "runtime", "server", "stream"]
 
 [dependencies.serde_]
 package = "serde"

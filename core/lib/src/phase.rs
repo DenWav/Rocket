@@ -1,6 +1,8 @@
 use state::Container;
 use figment::Figment;
 
+use crate::websocket::broker::Broker;
+use crate::websocket::token::TokenTable;
 use crate::{Catcher, Config, Rocket, Route, Shutdown};
 use crate::router::Router;
 use crate::fairing::Fairings;
@@ -83,6 +85,7 @@ phases! {
         pub(crate) catchers: Vec<Catcher>,
         pub(crate) fairings: Fairings,
         pub(crate) figment: Figment,
+        //pub(crate) broker: Broker,
         pub(crate) state: Container![Send + Sync],
     }
 
@@ -97,6 +100,7 @@ phases! {
         pub(crate) fairings: Fairings,
         pub(crate) figment: Figment,
         pub(crate) config: Config,
+        pub(crate) broker: Broker,
         pub(crate) state: Container![Send + Sync],
         pub(crate) shutdown: Shutdown,
     }
@@ -111,7 +115,9 @@ phases! {
         pub(crate) fairings: Fairings,
         pub(crate) figment: Figment,
         pub(crate) config: Config,
+        pub(crate) broker: Broker,
         pub(crate) state: Container![Send + Sync],
         pub(crate) shutdown: Shutdown,
+        pub(crate) websocket_tokens: TokenTable,
     }
 }

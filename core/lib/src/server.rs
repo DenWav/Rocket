@@ -2,27 +2,37 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use yansi::Paint;
-use tokio::sync::oneshot;
-use tokio::time::sleep;
+use channel::Channel;
+use futures::future::{self, BoxFuture, Future, FutureExt, TryFutureExt};
 use futures::stream::StreamExt;
-use futures::future::{FutureExt, Future, BoxFuture};
+use rocket_http::hyper::upgrade::OnUpgrade;
+use tokio::sync::oneshot;
+use yansi::Paint;
 
-use crate::{route, Rocket, Orbit, Request, Response, Data, Config};
+use crate::error::{Error, ErrorKind};
+use crate::ext::{AsyncReadExt, CancellableIo, CancellableListener};
 use crate::form::Form;
 use crate::outcome::Outcome;
-use crate::error::{Error, ErrorKind};
-use crate::ext::{AsyncReadExt, CancellableListener, CancellableIo};
 use crate::request::ConnectionMeta;
+use crate::websocket::channel;
+use crate::websocket::channel::WebSocketChannel;
+use crate::websocket::request::WsRequest;
+use crate::websocket::status::StatusError;
+use crate::websocket::status::WebSocketStatus;
+use crate::websocket::WebSocketEvent;
+use crate::websocket::{Extensions, WebSocketData};
+use crate::{route, Config, Data, Orbit, Request, Response, Rocket};
 
-use crate::http::{hyper, Method, Status, Header};
-use crate::http::private::{TcpListener, Listener, Connection, Incoming};
+use crate::http::private::{Connection, Incoming, Listener, TcpListener};
+use crate::http::{hyper, uri::Origin, Header, Method, Status};
 
 // A token returned to force the execution of one method before another.
 pub(crate) struct RequestToken;
 
 async fn handle<Fut, T, F>(name: Option<&str>, run: F) -> Option<T>
-    where F: FnOnce() -> Fut, Fut: Future<Output = T>,
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
 {
     use std::panic::AssertUnwindSafe;
 
@@ -30,7 +40,7 @@ async fn handle<Fut, T, F>(name: Option<&str>, run: F) -> Option<T>
         ($name:expr, $e:expr) => {{
             match $name {
                 Some(name) => error_!("Handler {} panicked.", Paint::white(name)),
-                None => error_!("A handler panicked.")
+                None => error_!("A handler panicked."),
             };
 
             info_!("This is an application bug.");
@@ -42,11 +52,11 @@ async fn handle<Fut, T, F>(name: Option<&str>, run: F) -> Option<T>
             info_!("Values of either type can be returned directly from handlers.");
             warn_!("A panic is treated as an internal server error.");
             $e
-        }}
+        }};
     }
 
     let run = AssertUnwindSafe(run);
-    let fut = std::panic::catch_unwind(move || run())
+    let fut = std::panic::catch_unwind(run)
         .map_err(|e| panic_info!(name, e))
         .ok()?;
 
@@ -64,7 +74,7 @@ async fn handle<Fut, T, F>(name: Option<&str>, run: F) -> Option<T>
 async fn hyper_service_fn(
     rocket: Arc<Rocket<Orbit>>,
     conn: ConnectionMeta,
-    hyp_req: hyper::Request<hyper::Body>,
+    mut hyp_req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, io::Error> {
     // This future must return a hyper::Response, but the response body might
     // borrow from the request. Instead, write the body in another future that
@@ -72,16 +82,42 @@ async fn hyper_service_fn(
     let (tx, rx) = oneshot::channel();
 
     tokio::spawn(async move {
+        let upgrade = crate::websocket::upgrade(&mut hyp_req);
         // Convert a Hyper request into a Rocket request.
         let (h_parts, mut h_body) = hyp_req.into_parts();
         match Request::from_hyp(&rocket, &h_parts, Some(conn)) {
             Ok(mut req) => {
                 // Convert into Rocket `Data`, dispatch request, write response.
                 let mut data = Data::from(&mut h_body);
+
+                // This needs to be handled BEFORE the request is processed by the fairings, to avoid work
+                // getting erased when the cache is swapped
+                //
+                // This could be refactored by doing this and the fairings inside the upgrade if statement
+                if upgrade.is_some() {
+                    if let Some(token_ref) = rocket.websocket_tokens.from_uri(req.uri()) {
+                        // Handle based on Token
+                        req.set_uri(token_ref.uri);
+                        req.state.cache = token_ref.cache;
+                    }
+                }
+
+                // Dispatch the request to get a response, then write that response out.
                 let token = rocket.preprocess_request(&mut req, &mut data).await;
-                let response = rocket.dispatch(token, &mut req, data).await;
-                rocket.send_response(response, tx).await;
-            },
+                if let Some((accept, upgrade)) = upgrade {
+                    let ws_req = WsRequest::new(&req);
+                    // req.clone() is nessecary since the request is borrowed to hande the response. This
+                    // copy can (and will) outlive the actual request, but will not outlive the websocket
+                    // connection.
+                    //let req_copy = req.clone();
+                    let (r, ext) = rocket.dispatch_ws(token, &mut req, data, accept).await;
+                    rocket.send_response(r, tx).await;
+                    rocket.ws_event_loop(ws_req, upgrade, ext).await;
+                } else {
+                    let response = rocket.dispatch(token, &mut req, data).await;
+                    rocket.send_response(response, tx).await;
+                }
+            }
             Err(e) => {
                 warn!("Bad incoming HTTP request.");
                 e.errors.iter().for_each(|e| warn_!("Error: {}.", e));
@@ -90,11 +126,12 @@ async fn hyper_service_fn(
                 let response = rocket.handle_error(Status::BadRequest, &e.request).await;
                 rocket.send_response(response, tx).await;
             }
-        }
+        };
     });
 
     // Receive the response written to `tx` by the task above.
-    rx.await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+    rx.await
+        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
 }
 
 impl Rocket<Orbit> {
@@ -106,7 +143,7 @@ impl Rocket<Orbit> {
         tx: oneshot::Sender<hyper::Response<hyper::Body>>,
     ) {
         let remote_hungup = |e: &io::Error| match e.kind() {
-            | io::ErrorKind::BrokenPipe
+            io::ErrorKind::BrokenPipe
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted => true,
             _ => false,
@@ -141,7 +178,8 @@ impl Rocket<Orbit> {
         }
 
         let (mut sender, hyp_body) = hyper::Body::channel();
-        let hyp_response = hyp_res.body(hyp_body)
+        let hyp_response = hyp_res
+            .body(hyp_body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         tx.send(hyp_response).map_err(|_| {
@@ -152,7 +190,9 @@ impl Rocket<Orbit> {
         let max_chunk_size = body.max_chunk_size();
         let mut stream = body.into_bytes_stream(max_chunk_size);
         while let Some(next) = stream.next().await {
-            sender.send_data(next?).await
+            sender
+                .send_data(next?)
+                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         }
 
@@ -168,7 +208,7 @@ impl Rocket<Orbit> {
     pub(crate) async fn preprocess_request(
         &self,
         req: &mut Request<'_>,
-        data: &mut Data<'_>
+        data: &mut Data<'_>,
     ) -> RequestToken {
         // Check if this is a form and if the form contains the special _method
         // field which we use to reinterpret the request's method.
@@ -177,7 +217,8 @@ impl Rocket<Orbit> {
         let is_form = req.content_type().map_or(false, |ct| ct.is_form());
 
         if is_form && req.method() == Method::Post && peek_buffer.len() >= min_len {
-            let method = std::str::from_utf8(peek_buffer).ok()
+            let method = std::str::from_utf8(peek_buffer)
+                .ok()
                 .and_then(|raw_form| Form::values(raw_form).next())
                 .filter(|field| field.name == "_method")
                 .and_then(|field| field.value.parse().ok());
@@ -198,7 +239,7 @@ impl Rocket<Orbit> {
         &'s self,
         _token: RequestToken,
         request: &'r Request<'s>,
-        data: Data<'r>
+        data: Data<'r>,
     ) -> Response<'r> {
         info!("{}:", request);
 
@@ -230,7 +271,7 @@ impl Rocket<Orbit> {
     async fn route_and_process<'s, 'r: 's>(
         &'s self,
         request: &'r Request<'s>,
-        data: Data<'r>
+        data: Data<'r>,
     ) -> Response<'r> {
         let mut response = match self.route(request, data).await {
             Outcome::Success(response) => response,
@@ -277,7 +318,8 @@ impl Rocket<Orbit> {
             request.set_route(route);
 
             let name = route.name.as_deref();
-            let outcome = handle(name, || route.handler.handle(request, data)).await
+            let outcome = handle(name, || route.handler.handle(request, data))
+                .await
                 .unwrap_or(Outcome::Failure(Status::InternalServerError));
 
             // Check if the request processing completed (Some) or if the
@@ -285,7 +327,7 @@ impl Rocket<Orbit> {
             // (None) to try again.
             info_!("{} {}", Paint::default("Outcome:").bold(), outcome);
             match outcome {
-                o@Outcome::Success(_) | o@Outcome::Failure(_) => return o,
+                o @ Outcome::Success(_) | o @ Outcome::Failure(_) => return o,
                 Outcome::Forward(unused_data) => data = unused_data,
             }
         }
@@ -307,7 +349,7 @@ impl Rocket<Orbit> {
     async fn invoke_catcher<'s, 'r: 's>(
         &'s self,
         status: Status,
-        req: &'r Request<'s>
+        req: &'r Request<'s>,
     ) -> Result<Response<'r>, Option<Status>> {
         // For now, we reset the delta state to prevent any modifications
         // from earlier, unsuccessful paths from being reflected in error
@@ -317,7 +359,8 @@ impl Rocket<Orbit> {
         if let Some(catcher) = self.router.catch(status, req) {
             warn_!("Responding with registered {} catcher.", catcher);
             let name = catcher.name.as_deref();
-            handle(name, || catcher.handler.handle(status, req)).await
+            handle(name, || catcher.handler.handle(status, req))
+                .await
                 .map(|result| result.map_err(Some))
                 .unwrap_or_else(|| Err(None))
         } else {
@@ -334,7 +377,7 @@ impl Rocket<Orbit> {
     pub(crate) async fn handle_error<'s, 'r: 's>(
         &'s self,
         mut status: Status,
-        req: &'r Request<'s>
+        req: &'r Request<'s>,
     ) -> Response<'r> {
         // Dispatch to the `status` catcher.
         if let Ok(r) = self.invoke_catcher(status, req).await {
@@ -355,14 +398,224 @@ impl Rocket<Orbit> {
         crate::catcher::default_handler(Status::InternalServerError, req)
     }
 
+    /// Dispatch the Websocket response. This does not invoke ANY user handlers.
+    ///
+    /// Instead, the join handler is allowed to fail the connection after the first message, with a
+    /// Websocket Status Code. This should check the router's websocket connections, to return a
+    /// 404 if the endpoint doesn't exist.
+    #[inline]
+    pub(crate) async fn dispatch_ws<'s, 'r: 's>(
+        &'s self,
+        _token: RequestToken,
+        request: &'r Request<'s>,
+        _data: Data<'r>,
+        accept: String,
+    ) -> (Response<'r>, Extensions) {
+        info!("{}:", request);
+
+        // remeber the protocol for later
+        let extensions = Extensions::new(request);
+
+        let mut response = if !self
+            .router
+            .route_event(WebSocketEvent::Message)
+            .any(|r| r.matches(request))
+        {
+            // If there is no Message handler for the route
+            self.handle_error(Status::NotFound, request).await
+        } else {
+            use rocket_http::hyper::header::{CONNECTION, UPGRADE};
+            let mut response = Response::build();
+            response.status(Status::SwitchingProtocols);
+            response.header(Header::new(CONNECTION.as_str(), "upgrade"));
+            response.header(Header::new(UPGRADE.as_str(), "websocket"));
+            response.header(Header::new("Sec-WebSocket-Accept", accept));
+            if let Some(ident) = request.rocket().config.ident.as_str() {
+                response.header(Header::new("Server", ident));
+            }
+
+            extensions.headers(&mut response);
+
+            response.finalize()
+        };
+
+        // Run the response fairings.
+        self.fairings.handle_response(request, &mut response).await;
+
+        (response, extensions)
+    }
+
+    /// Routes a websocket event. This is different from an HTTP route in that the event is passed
+    /// seperately, but the reqest still holds all the nessecary information
+    // TODO: Simplify the lifetime bounds
+    async fn route_event<'s: 'ri, 'r, 'ri>(
+        &'s self,
+        req: &'r Channel<'ri>,
+        event: WebSocketEvent,
+        mut data: WebSocketData<'r>,
+    ) -> route::WsOutcome<'r> {
+        for route in self
+            .router
+            .route_event(event)
+            .filter(|r| r.matches(req.request()))
+        {
+            info_!("Matched: {:#}", route);
+            req.request().set_route(route);
+
+            let name = route.name.as_deref();
+            let handler = route.websocket_handler.unwrap_ref();
+            let outcome = handle(name, || handler.handle(req, data))
+                .await
+                .unwrap_or_else(|| Outcome::Failure(WebSocketStatus::InternalServerError));
+
+            // Check if the request processing completed (Some) or if the
+            // request needs to be forwarded. If it does, continue the loop
+            // (None) to try again.
+            info_!("{} {}", Paint::default("Outcome:").bold(), outcome);
+            match outcome {
+                o @ Outcome::Success(_) | o @ Outcome::Failure(_) => return o,
+                Outcome::Forward(unused_data) => data = unused_data,
+            }
+        }
+        route::WsOutcome::Forward(data)
+    }
+
+    async fn ws_event_loop<'r>(
+        &'r self,
+        mut req: WsRequest<'r>,
+        upgrade: OnUpgrade,
+        extensions: Extensions,
+    ) {
+        if let Ok(upgrade) = upgrade.await {
+            let (ch, a, b) = WebSocketChannel::new(upgrade, extensions);
+            req.set_handle(ch.subscribe_handle());
+            let event_loop = async move {
+                // Explicit moves
+                let mut ch = ch;
+                let mut close_status = Err(StatusError::NoStatus);
+                let broker = self.broker();
+                let chan = req.ephemeral_channel();
+                match self
+                    .route_event(&chan, WebSocketEvent::Join, WebSocketData::Join)
+                    .await
+                {
+                    Outcome::Success(()) => {
+                        broker.subscribe(chan.topic(), &ch).await;
+                    }
+                    Outcome::Failure(_r) => (),
+                    // On forward (e.g. none match), we retry against the message handlers. This
+                    // runs everything up to the data guard.
+                    Outcome::Forward(_) => match self
+                        .route_event(&chan, WebSocketEvent::Message, WebSocketData::Join)
+                        .await
+                    {
+                        Outcome::Success(()) => {
+                            broker.subscribe(chan.topic(), &ch).await;
+                        }
+                        _ => (),
+                    },
+                }
+                req.complete_channel(chan);
+                while let Some(message) = ch.next().await {
+                    let data = match message.opcode() {
+                        websocket_codec::Opcode::Text => Data::from_ws(message, Some(false)),
+                        websocket_codec::Opcode::Binary => Data::from_ws(message, Some(true)),
+                        websocket_codec::Opcode::Close => {
+                            if let Some(status) = message.inner().recv().await {
+                                close_status = WebSocketStatus::decode(status);
+                            }
+                            break;
+                        }
+                        _ => panic!(
+                            "An unexpected error occured while\
+                                    processing websocket messages. {:?}\
+                                    has an invalid opcode",
+                            message
+                        ),
+                    };
+                    //req.set_topic(Origin::parse("/echo/we").unwrap());
+                    let chan = req.ephemeral_channel();
+                    match self
+                        .route_event(&chan, WebSocketEvent::Message, WebSocketData::Message(data))
+                        .await
+                    {
+                        Outcome::Forward(_data) => {
+                            break;
+                        }
+                        Outcome::Failure(status) => {
+                            error_!("{}", status);
+                            ch.close(status).await;
+                            break;
+                        }
+                        Outcome::Success(()) => (),
+                    }
+                    req.complete_channel(chan);
+                }
+                broker.unsubscribe_all(&ch).await;
+                info_!("Websocket closed with status: {:?}", close_status);
+                let default_response = WebSocketStatus::default_response(&close_status);
+                // TODO provide close message
+                let chan = req.ephemeral_channel();
+                match self
+                    .route_event(
+                        &chan,
+                        WebSocketEvent::Leave,
+                        WebSocketData::Leave(close_status),
+                    )
+                    .await
+                {
+                    Outcome::Forward(_data) => (),
+                    Outcome::Failure(status) => {
+                        error_!("{}", status);
+                        ch.close(status).await;
+                    }
+                    Outcome::Success(()) => (),
+                }
+                // Note: If a close has already been sent, the writer task will just drop this
+                ch.close(default_response).await;
+                req.complete_channel(chan); // TODO: likely unnessecary, since there are no more messages
+            };
+            // This will poll each future, on the same thread. This should actually be more
+            // preformant than spawning tasks for each.
+            tokio::join!(a, b, event_loop);
+        } else {
+            todo!("Handle upgrade error")
+        }
+    }
+
+    async fn cleanup_tokens(&self) {
+        for token_ref in self.websocket_tokens.get_expired() {
+            let mut req = Request::new(self, Method::Get, token_ref.uri);
+            req.state.cache = token_ref.cache;
+
+            let (sender, _rx) = tokio::sync::mpsc::channel(1);
+            drop(_rx);
+            let req = Channel::new(req, sender);
+            match self
+                .route_event(
+                    &req,
+                    WebSocketEvent::Leave,
+                    WebSocketData::Leave(Err(StatusError::NeverJoined)),
+                )
+                .await
+            {
+                Outcome::Forward(_data) => {}
+                Outcome::Failure(_status) => {}
+                Outcome::Success(_response) => {}
+            };
+        }
+    }
+
     pub(crate) async fn default_tcp_http_server<C>(mut self, ready: C) -> Result<Self, Error>
-        where C: for<'a> Fn(&'a Self) -> BoxFuture<'a, ()>
+    where
+        C: for<'a> Fn(&'a Self) -> BoxFuture<'a, ()>,
     {
         use std::net::ToSocketAddrs;
 
         // Determine the address we're going to serve on.
         let addr = format!("{}:{}", self.config.address, self.config.port);
-        let mut addr = addr.to_socket_addrs()
+        let mut addr = addr
+            .to_socket_addrs()
             .map(|mut addrs| addrs.next().expect(">= 1 socket addr"))
             .map_err(|e| Error::new(ErrorKind::Io(e)))?;
 
@@ -372,7 +625,9 @@ impl Rocket<Orbit> {
                 use crate::http::tls::TlsListener;
 
                 let conf = config.to_native_config().map_err(ErrorKind::Io)?;
-                let l = TlsListener::bind(addr, conf).await.map_err(ErrorKind::Bind)?;
+                let l = TlsListener::bind(addr, conf)
+                    .await
+                    .map_err(ErrorKind::Bind)?;
                 addr = l.local_addr().unwrap_or(addr);
                 self.config.address = addr.ip();
                 self.config.port = addr.port();
@@ -391,19 +646,31 @@ impl Rocket<Orbit> {
 
     // TODO.async: Solidify the Listener APIs and make this function public
     pub(crate) async fn http_server<L>(self, listener: L) -> Result<Self, Error>
-        where L: Listener + Send, <L as Listener>::Connection: Send + Unpin + 'static
+    where
+        L: Listener + Send,
+        <L as Listener>::Connection: Send + Unpin + 'static,
     {
         // Emit a warning if we're not running inside of Rocket's async runtime.
         if self.config.profile == Config::DEBUG_PROFILE {
             tokio::task::spawn_blocking(|| {
-                let this  = std::thread::current();
-                if !this.name().map_or(false, |s| s.starts_with("rocket-worker")) {
+                let this = std::thread::current();
+                if !this
+                    .name()
+                    .map_or(false, |s| s.starts_with("rocket-worker"))
+                {
                     warn!("Rocket is executing inside of a custom runtime.");
                     info_!("Rocket's runtime is enabled via `#[rocket::main]` or `#[launch]`.");
                     info_!("Forced shutdown is disabled. Runtime settings may be suboptimal.");
                 }
             });
         }
+
+        // Determine keep-alives.
+        let http1_keepalive = self.config.keep_alive != 0;
+        let http2_keep_alive = match self.config.keep_alive {
+            0 => None,
+            n => Some(Duration::from_secs(n as u64)),
+        };
 
         // Set up cancellable I/O from the given listener. Shutdown occurs when
         // `Shutdown` (`TripWire`) resolves. This can occur directly through a
@@ -435,6 +702,17 @@ impl Rocket<Orbit> {
 
         // Create the Hyper `Service`.
         let rocket = Arc::new(self);
+        // ~ rocket.broker(), but avoids clone
+        rocket.0.broker.with_rocket(Arc::downgrade(&rocket));
+        // Spawn periodic cleanup task
+        let rocket_handle = Arc::clone(&rocket);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                rocket_handle.cleanup_tokens().await;
+            }
+        });
+
         let service_fn = |conn: &CancellableIo<_, L::Connection>| {
             let rocket = rocket.clone();
             let connection = ConnectionMeta {
@@ -505,9 +783,9 @@ impl Rocket<Orbit> {
                 // beforehand to ensure we don't add shutdown fairing completion
                 // time, which is arbitrary, to these periods.
                 info!("Shutdown requested. Waiting for pending I/O...");
-                let grace_timer = sleep(Duration::from_secs(grace));
-                let mercy_timer = sleep(Duration::from_secs(grace + mercy));
-                let shutdown_timer = sleep(Duration::from_secs(grace + mercy + 1));
+                let grace_timer = tokio::time::sleep(Duration::from_secs(grace));
+                let mercy_timer = tokio::time::sleep(Duration::from_secs(grace + mercy));
+                let shutdown_timer = tokio::time::sleep(Duration::from_secs(grace + mercy + 1));
                 rocket.fairings.handle_shutdown(&*rocket).await;
 
                 tokio::pin!(grace_timer, mercy_timer, shutdown_timer);

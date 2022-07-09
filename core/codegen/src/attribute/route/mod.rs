@@ -1,17 +1,17 @@
 mod parse;
 
 use std::hash::Hash;
+use std::net::IpAddr;
 
-use devise::{Spanned, SpanWrapped, Result, FromMeta, Diagnostic};
-use devise::ext::TypeExt as _;
-use proc_macro2::{TokenStream, Span};
-
+use crate::attribute::param::{Guard, Parameter};
+use crate::http_codegen::{Optional, WebSocketEvent};
 use crate::proc_macro_ext::StringLit;
 use crate::syn_ext::{IdentExt, TypeExt as _};
-use crate::http_codegen::{Method, Optional};
-use crate::attribute::param::Guard;
+use devise::ext::TypeExt as _;
+use devise::{Diagnostic, FromMeta, Result, SpanWrapped, Spanned};
+use proc_macro2::{Literal, Span, TokenStream};
 
-use self::parse::{Route, Attribute, MethodAttribute};
+use self::parse::{Attribute, MethodAttribute, Route};
 
 impl Route {
     pub fn guards(&self) -> impl Iterator<Item = &Guard> {
@@ -42,22 +42,25 @@ fn query_decls(route: &Route) -> Option<TokenStream> {
     );
 
     // Record all of the static parameters for later filtering.
-    let (raw_name, raw_value) = route.query_params.iter()
+    let (raw_name, raw_value) = route
+        .query_params
+        .iter()
         .filter_map(|s| s.r#static())
         .map(|name| match name.find('=') {
             Some(i) => (&name[..i], &name[i + 1..]),
-            None => (name.as_str(), "")
+            None => (name.as_str(), ""),
         })
         .split2();
 
     // Now record all of the dynamic parameters.
-    let (name, matcher, ident, init_expr, push_expr, finalize_expr) = route.query_guards()
+    let (name, matcher, ident, init_expr, push_expr, finalize_expr) = route
+        .query_guards()
         .map(|guard| {
             let (name, ty) = (&guard.name, &guard.ty);
             let ident = guard.fn_ident.rocketized().with_span(ty.span());
             let matcher = match guard.trailing {
                 true => quote_spanned!(name.span() => _),
-                _ => quote!(#name)
+                _ => quote!(#name),
             };
 
             define_spanned_export!(ty.span() => FromForm, _form);
@@ -112,14 +115,20 @@ fn query_decls(route: &Route) -> Option<TokenStream> {
     })
 }
 
-fn request_guard_decl(guard: &Guard) -> TokenStream {
+fn request_guard_decl(guard: &Guard, websocket: bool) -> TokenStream {
     let (ident, ty) = (guard.fn_ident.rocketized(), &guard.ty);
     define_spanned_export!(ty.span() =>
-        __req, __data, _request, _log, FromRequest, Outcome
+        __req, __data, _request, _log, FromRequest, FromWebSocket, Outcome
     );
 
+    let conversion = if websocket {
+        quote_spanned!(ty.span() => <#ty as #FromWebSocket>::from_websocket(#__req))
+    } else {
+        quote_spanned!(ty.span() => <#ty as #FromRequest>::from_request(#__req))
+    };
+
     quote_spanned! { ty.span() =>
-        let #ident: #ty = match <#ty as #FromRequest>::from_request(#__req).await {
+        let #ident: #ty = match #conversion.await {
             #Outcome::Success(__v) => __v,
             #Outcome::Forward(_) => {
                 #_log::warn_!("Request guard `{}` is forwarding.", stringify!(#ty));
@@ -133,7 +142,7 @@ fn request_guard_decl(guard: &Guard) -> TokenStream {
     }
 }
 
-fn param_guard_decl(guard: &Guard) -> TokenStream {
+fn param_guard_decl(guard: &Guard, _websocket: bool) -> TokenStream {
     let (i, name, ty) = (guard.index, &guard.name, &guard.ty);
     define_spanned_export!(ty.span() =>
         __req, __data, _log, _None, _Some, _Ok, _Err,
@@ -177,20 +186,55 @@ fn param_guard_decl(guard: &Guard) -> TokenStream {
     quote!(let #ident: #ty = #expr;)
 }
 
-fn data_guard_decl(guard: &Guard) -> TokenStream {
+fn data_guard_decl(guard: &Guard, websocket: &WebSocketEvent) -> TokenStream {
     let (ident, ty) = (guard.fn_ident.rocketized(), &guard.ty);
-    define_spanned_export!(ty.span() => _log, __req, __data, FromData, Outcome);
+    define_spanned_export!(ty.span() =>
+        _log, __req, __data, FromData, Outcome, WebSocketData, _route
+    );
+
+    let (method, data) = match websocket {
+        WebSocketEvent::WebSocketJoin => (
+            quote!(from_ws),
+            quote! {
+                let #__data = match #__data {
+                    #WebSocketData::Join => (),
+                    data => return #Outcome::Forward(data),
+                };
+            },
+        ),
+        WebSocketEvent::WebSocketMessage => (
+            quote!(from_ws),
+            quote! {
+                let mut #__data = match #__data {
+                    #WebSocketData::Join => return #Outcome::Success(()),
+                    #WebSocketData::Message(data) => data,
+                    data => return #Outcome::Forward(data),
+                };
+            },
+        ),
+        WebSocketEvent::WebSocketLeave => {
+            return quote_spanned! { ty.span() =>
+                let #__data = match #__data {
+                    #WebSocketData::Leave(data) => data.into(),
+                    data => return #Outcome::Forward(data),
+                };
+            }
+        }
+        WebSocketEvent::Http(_) => (quote!(from_data), quote! {}),
+    };
 
     quote_spanned! { ty.span() =>
-        let #ident: #ty = match <#ty as #FromData>::from_data(#__req, #__data).await {
+        #data
+        let mut #__data = #__data;
+        let #ident: #ty = match <#ty as #FromData>::#method(#__req, #__data).await {
             #Outcome::Success(__d) => __d,
             #Outcome::Forward(__d) => {
                 #_log::warn_!("Data guard `{}` is forwarding.", stringify!(#ty));
-                return #Outcome::Forward(__d);
+                return #Outcome::Forward(__d.into());
             }
             #Outcome::Failure((__c, __e)) => {
                 #_log::warn_!("Data guard `{}` failed: {:?}.", stringify!(#ty), __e);
-                return #Outcome::Failure(__c);
+                return #Outcome::Failure(__c.into());
             }
         };
     }
@@ -198,7 +242,8 @@ fn data_guard_decl(guard: &Guard) -> TokenStream {
 
 fn internal_uri_macro_decl(route: &Route) -> TokenStream {
     // FIXME: Is this the right order? Does order matter?
-    let uri_args = route.param_guards()
+    let uri_args = route
+        .param_guards()
         .chain(route.query_guards())
         .map(|guard| (&guard.fn_ident, &guard.ty))
         .map(|(ident, ty)| quote!(#ident: #ty));
@@ -228,33 +273,50 @@ fn internal_uri_macro_decl(route: &Route) -> TokenStream {
     }
 }
 
-fn responder_outcome_expr(route: &Route) -> TokenStream {
+fn responder_outcome_expr(route: &Route, websocket: bool) -> TokenStream {
     let ret_span = match route.handler.sig.output {
         syn::ReturnType::Default => route.handler.sig.ident.span(),
-        syn::ReturnType::Type(_, ref ty) => ty.span()
+        syn::ReturnType::Type(_, ref ty) => ty.span(),
     };
 
     let user_handler_fn_name = &route.handler.sig.ident;
-    let parameter_names = route.arguments.map.values()
+    let parameter_names = route
+        .arguments
+        .map
+        .values()
         .map(|(ident, _)| ident.rocketized());
 
-    let _await = route.handler.sig.asyncness
+    let _await = route
+        .handler
+        .sig
+        .asyncness
         .map(|a| quote_spanned!(a.span() => .await));
 
-    define_spanned_export!(ret_span => __req, _route);
-    quote_spanned! { ret_span =>
-        let ___responder = #user_handler_fn_name(#(#parameter_names),*) #_await;
-        #_route::Outcome::from(#__req, ___responder)
+    define_spanned_export!(ret_span => __req, _route, Outcome);
+
+    if websocket {
+        quote_spanned! { ret_span =>
+            let ___responder: () = #user_handler_fn_name(#(#parameter_names),*) #_await;
+            #Outcome::Success(())
+        }
+    } else {
+        quote_spanned! { ret_span =>
+            let ___responder = #user_handler_fn_name(#(#parameter_names),*) #_await;
+            #_route::Outcome::from(#__req, ___responder).into()
+        }
     }
 }
 
 fn sentinels_expr(route: &Route) -> TokenStream {
     let ret_ty = match route.handler.sig.output {
         syn::ReturnType::Default => None,
-        syn::ReturnType::Type(_, ref ty) => Some(ty.with_stripped_lifetimes())
+        syn::ReturnType::Type(_, ref ty) => Some(ty.with_stripped_lifetimes()),
     };
 
-    let generic_idents: Vec<_> = route.handler.sig.generics
+    let generic_idents: Vec<_> = route
+        .handler
+        .sig
+        .generics
         .type_params()
         .map(|p| &p.ident)
         .collect();
@@ -285,11 +347,12 @@ fn sentinels_expr(route: &Route) -> TokenStream {
 
         match syn::parse2(tokens.clone()).ok()? {
             Input::Type(ty, ..) => Some(ty),
-            Input::Tokens(..) => None
+            Input::Tokens(..) => None,
         }
     }
 
-    let eligible_types = route.guards()
+    let eligible_types = route
+        .guards()
         .map(|guard| &guard.ty)
         .chain(ret_ty.as_ref().into_iter())
         .flat_map(|ty| ty.unfold_with_ty_macros(TY_MACS, ty_mac_mapper))
@@ -310,14 +373,88 @@ fn sentinels_expr(route: &Route) -> TokenStream {
     quote!(::std::vec![#(#sentinel),*])
 }
 
+fn monomorphized_function(route: &Route) -> TokenStream {
+    use crate::exports::*;
+
+    let request_guards = route
+        .request_guards
+        .iter()
+        .map(|r| request_guard_decl(r, route.attr.method.is_websocket()));
+    let param_guards = route
+        .param_guards()
+        .map(|r| param_guard_decl(r, route.attr.method.is_websocket()));
+    let query_guards = query_decls(&route);
+    let data_guard = route
+        .data_guard
+        .as_ref()
+        .map(|r| data_guard_decl(r, &route.attr.method));
+
+    let responder_outcome = responder_outcome_expr(&route, route.attr.method.is_websocket());
+
+    let (request, box_future, datatype) = if route.attr.method.is_websocket() {
+        (WebSocket, quote!(BoxWsFuture), WebSocketData)
+    } else {
+        (Request, quote!(BoxFuture), Data)
+    };
+
+    quote! {
+        fn monomorphized_function<'__r>(
+            #__req: &'__r #request<'_>,
+            #__data: #datatype<'__r>,
+        ) -> #_route::#box_future<'__r> {
+            #_Box::pin(async move {
+                #(#request_guards)*
+                #(#param_guards)*
+                #query_guards
+                #data_guard
+
+                #responder_outcome
+            })
+        }
+    }
+}
+
 fn codegen_route(route: Route) -> Result<TokenStream> {
     use crate::exports::*;
 
-    // Generate the declarations for all of the guards.
-    let request_guards = route.request_guards.iter().map(request_guard_decl);
-    let param_guards = route.param_guards().map(param_guard_decl);
-    let query_guards = query_decls(&route);
-    let data_guard = route.data_guard.as_ref().map(data_guard_decl);
+    // Check for various websocket specific errors. Although this could be implemented via a
+    // seperate attr type, this method allows the errors to be customized.
+    if route.attr.method.is_websocket() {
+        if let syn::ReturnType::Type(arrow, _) = &route.handler.sig.output {
+            return Err(Diagnostic::spanned(
+                arrow.span(),
+                devise::Level::Error,
+                "WebSocket Event handlers are not permitted to return values",
+            ));
+        }
+        if let Some(media_type) = &route.attr.format {
+            return Err(Diagnostic::spanned(
+                media_type.span(),
+                devise::Level::Error,
+                "WebSocket Event handlers do not support formats (yet)",
+            ));
+        }
+        let mut iter = route.path_params.iter();
+        match iter.next() {
+            Some(Parameter::Static(name)) if name == "websocket" => match iter.next() {
+                Some(Parameter::Static(name)) if name == "token" => match iter.next() {
+                    Some(Parameter::Dynamic(_)) => match iter.next() {
+                        None => {
+                            return Err(Diagnostic::spanned(
+                                route.attr.uri.path_span().span(),
+                                devise::Level::Error,
+                                "`/websocket/token/<_>` conflicts with websocket tokens",
+                            ))
+                        }
+                        _ => (),
+                    },
+                    _ => (),
+                },
+                _ => (),
+            },
+            _ => (),
+        }
+    }
 
     // Extract the sentinels from the route.
     let sentinels = sentinels_expr(&route);
@@ -326,12 +463,27 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
     let (vis, handler_fn) = (&route.handler.vis, &route.handler);
     let handler_fn_name = &handler_fn.sig.ident;
     let internal_uri_macro = internal_uri_macro_decl(&route);
-    let responder_outcome = responder_outcome_expr(&route);
 
-    let method = route.attr.method;
+    let method = route.attr.method.http_method();
+    let method = quote_spanned!(route.attr.method.span() => #method);
     let uri = route.attr.uri.to_string();
     let rank = Optional(route.attr.rank);
     let format = Optional(route.attr.format.as_ref());
+
+    let function = monomorphized_function(&route);
+
+    let (handler, websocket_handler) = if route.attr.method.is_websocket() {
+        let ws = route.attr.method;
+        (
+            quote!(upgrade_required),
+            quote!(#ws(monomorphized_function)),
+        )
+    } else {
+        (
+            quote!(monomorphized_function),
+            quote!(#WebSocketEvent::None),
+        )
+    };
 
     Ok(quote! {
         #handler_fn
@@ -345,17 +497,15 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
         impl #handler_fn_name {
             #[allow(non_snake_case, unreachable_patterns, unreachable_code)]
             fn into_info(self) -> #_route::StaticInfo {
-                fn monomorphized_function<'__r>(
+                #function
+
+                #[allow(dead_code)]
+                fn upgrade_required<'__r>(
                     #__req: &'__r #Request<'_>,
-                    #__data: #Data<'__r>
+                    #__data: #Data<'__r>,
                 ) -> #_route::BoxFuture<'__r> {
                     #_Box::pin(async move {
-                        #(#request_guards)*
-                        #(#param_guards)*
-                        #query_guards
-                        #data_guard
-
-                        #responder_outcome
+                        #_route::Outcome::from(#__req, #Status::UpgradeRequired)
                     })
                 }
 
@@ -363,7 +513,8 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                     name: stringify!(#handler_fn_name),
                     method: #method,
                     uri: #uri,
-                    handler: monomorphized_function,
+                    handler: #handler,
+                    websocket_handler: #websocket_handler,
                     format: #format,
                     rank: #rank,
                     sentinels: #sentinels,
@@ -392,9 +543,9 @@ fn complete_route(args: TokenStream, input: TokenStream) -> Result<TokenStream> 
 }
 
 fn incomplete_route(
-    method: crate::http::Method,
+    method: WebSocketEvent,
     args: TokenStream,
-    input: TokenStream
+    input: TokenStream,
 ) -> Result<TokenStream> {
     let method_str = method.to_string().to_lowercase();
     // FIXME(proc_macro): there should be a way to get this `Span`.
@@ -412,7 +563,10 @@ fn incomplete_route(
 
     let attribute = Attribute {
         method: SpanWrapped {
-            full_span: method_span, key_span: None, span: method_span, value: Method(method)
+            full_span: method_span,
+            key_span: None,
+            span: method_span,
+            value: method,
         },
         uri: method_attribute.uri,
         data: method_attribute.data,
@@ -423,14 +577,14 @@ fn incomplete_route(
     codegen_route(Route::from(attribute, function)?)
 }
 
-pub fn route_attribute<M: Into<Option<crate::http::Method>>>(
+pub fn route_attribute<M: Into<Option<N>>, N: Into<WebSocketEvent>>(
     method: M,
     args: proc_macro::TokenStream,
-    input: proc_macro::TokenStream
+    input: proc_macro::TokenStream,
 ) -> TokenStream {
     let result = match method.into() {
-        Some(method) => incomplete_route(method, args.into(), input.into()),
-        None => complete_route(args.into(), input.into())
+        Some(method) => incomplete_route(method.into(), args.into(), input.into()),
+        None => complete_route(args.into(), input.into()),
     };
 
     result.unwrap_or_else(|diag| diag.emit_as_item_tokens())

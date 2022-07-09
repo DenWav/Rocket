@@ -19,4 +19,8 @@ members = [
   "pastebin",
   "todo",
   "chat",
+
+  "websocket-echo",
+  "websocket-channels",
+  "websocket-auth",
 ]
